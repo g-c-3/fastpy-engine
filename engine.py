@@ -702,7 +702,9 @@ def generate_knights(
     temp: uint64 = knights
     while temp:
         from_sq: int32 = lsb(temp)
-        knight: uint64 = 1 << from_sq
+        # BIT_ONE << from_sq ensures uint64_t shift in C++.
+        # Plain `1 << from_sq` is a 32-bit int — wrong for from_sq > 30.
+        knight: uint64 = BIT_ONE << from_sq
 
         attacks: uint64 = (
             ((knight << 17) & ~FILE_A & FULL_BOARD) |
@@ -736,7 +738,7 @@ def generate_king(
 ) -> int32:
     """
     Generate all king moves (non-castling) from a king bitboard.
-    Castling is handled separately.
+    Castling is handled separately in Phase 3.
     Returns the updated count.
     """
     from_sq: int32 = lsb(king)
@@ -917,18 +919,279 @@ def find_best_move(
 
 
 # =============================================================================
-# MAIN — UCI entry point stub
-# Phase 1: compile-and-exit smoke test.
-# Phase 2: full UCI loop (uci / isready / position / go / bestmove).
+# MAIN — FastPy-compiled entry point (stub)
+#
+# In compiled C++ mode: returns 0 immediately.
+# For full UCI functionality, run the engine as Python:
+#     python engine.py
+#
+# Full C++ UCI loop is planned for a future sprint when FastPy gains
+# native I/O emission support.
 # =============================================================================
 
 def main() -> int32:
     """
-    Engine entry point.
+    Engine entry point (FastPy-compiled stub).
+    Returns 0. The UCI loop runs in Python mode only (see bottom of file).
 
-    Phase 1: Initialise the starting position, run a depth-1 search, exit.
-    Phase 2: Replace with a proper UCI protocol loop.
-
-    FastPy compiles this to a standard C++ `int32_t main()`.
+    FastPy compiles this to: int32_t main() { return 0; }
     """
     return 0
+
+
+# =============================================================================
+# UCI PROTOCOL — Python mode only
+#
+# FastPy's module visitor silently skips `if __name__ == '__main__':` blocks.
+# All code in this section runs only when the file is executed as Python.
+#
+# Usage:
+#   python engine.py        ← connect any UCI-compatible GUI to this command
+#
+# Compatible with:
+#   Arena, Cutechess, Python-Chess, Scid vs PC, any UCI-compatible GUI
+#
+# Commands implemented:
+#   uci            → id name/author + uciok
+#   isready        → readyok
+#   ucinewgame     → reset to starting position
+#   position startpos [moves e2e4 e7e5 ...]  → set board
+#   go depth N     → search N plies, output bestmove
+#   stop           → no-op (Phase 1 — no background search yet)
+#   quit           → exit cleanly
+#
+# Not yet supported:
+#   position fen <fen_string>    Phase 3
+#   go movetime / wtime / btime  Phase 2 (time management)
+#   setoption                    Phase 2
+#
+# Python search wrappers:
+#   The compiled functions alpha_beta() and find_best_move() use
+#   `moves: uint64[218]` which FastPy compiles to C-style stack arrays.
+#   These bare declarations are unbound in Python mode. The _alpha_beta_py
+#   and _find_best_move_py wrappers below replicate the exact same logic
+#   using Python lists — used only by the UCI loop.
+# =============================================================================
+
+if __name__ == '__main__':
+    import sys as _sys
+
+    # ── Python-mode search wrappers ───────────────────────────────────────────
+    #
+    # The compiled alpha_beta() and find_best_move() use `moves: uint64[218]`
+    # which FastPy emits as `uint64_t moves[218]` — a C-style stack array.
+    # In Python these bare declarations leave `moves` unbound, so the compiled
+    # functions cannot be called directly from Python.
+    #
+    # These wrappers mirror the compiled logic exactly, substituting Python
+    # lists for the stack arrays. Used ONLY by the UCI loop.
+
+    def _alpha_beta_py(board, depth, alpha, beta):
+        """Python-mode negamax alpha-beta (exact replica, Python lists)."""
+        if depth == 0:
+            return evaluate(board)
+        buf   = [0] * 218
+        count = generate_all_moves(board, buf, 0)
+        if count == 0:
+            return 0
+        best = NEG_INF
+        for i in range(count):
+            new_board = make_move(board, buf[i])
+            score = -_alpha_beta_py(new_board, depth - 1, -beta, -alpha)
+            if score > best:
+                best = score
+            if score > alpha:
+                alpha = score
+            if alpha >= beta:
+                break
+        return best
+
+    def _find_best_move_py(board, depth):
+        """
+        Python-mode root search (exact replica of find_best_move, Python lists).
+        Returns the best move as a packed uint64 (0 = no legal moves).
+        """
+        buf   = [0] * 218
+        count = generate_all_moves(board, buf, 0)
+        best_move  = 0
+        best_score = NEG_INF
+        alpha      = NEG_INF
+        beta       = INF
+        for i in range(count):
+            move      = buf[i]
+            new_board = make_move(board, move)
+            score     = -_alpha_beta_py(new_board, depth - 1, -beta, -alpha)
+            if score > best_score:
+                best_score = score
+                best_move  = move
+            if score > alpha:
+                alpha = score
+        return best_move
+
+    # ── Square and move string conversion ─────────────────────────────────────
+
+    def _sq_to_str(sq):
+        """
+        Square index (0–63) → UCI algebraic string ('a1'–'h8').
+        bit 0-2 = file (a=0 … h=7),  bit 3-5 = rank (1=0 … 8=7)
+        """
+        return chr(ord('a') + (sq & 7)) + chr(ord('1') + (sq >> 3))
+
+    def _move_to_uci(move):
+        """
+        Packed uint64 move word → UCI move string.
+        Examples: e2e4, g1f3, e7e8q (promotion suffix: q/n/b only — no rook promo yet)
+        """
+        s = _sq_to_str(move_from(move)) + _sq_to_str(move_to(move))
+        promo = move_promo(move)
+        if promo == PROMO_QUEEN:  return s + 'q'
+        if promo == PROMO_KNIGHT: return s + 'n'
+        if promo == PROMO_BISHOP: return s + 'b'
+        return s
+
+    # ── Move parsing ──────────────────────────────────────────────────────────
+
+    def _parse_sq(token, offset):
+        """
+        Parse a UCI square at character offset within token.
+        'e4' at offset 0 → file=(ord('e')-ord('a'))=4, rank=(ord('4')-ord('1'))=3
+        → square = rank * 8 + file = 28
+        """
+        return (ord(token[offset + 1]) - ord('1')) * 8 + (ord(token[offset]) - ord('a'))
+
+    def _parse_uci_move(token, board):
+        """
+        Parse a UCI move token and return the matching generated move.
+
+        Generates all pseudo-legal moves for the current position, then finds
+        the one with matching from/to squares and promotion piece.
+
+        Falls back to direct encoding if no match is found — this handles
+        edge cases in positions with only a partial move list (Phase 1 has
+        no sliding pieces, so legal moves are a subset).
+        """
+        from_sq    = _parse_sq(token, 0)
+        to_sq      = _parse_sq(token, 2)
+        want_promo = PROMO_NONE
+        if len(token) >= 5:
+            pc = token[4]
+            if   pc == 'q': want_promo = PROMO_QUEEN
+            elif pc == 'n': want_promo = PROMO_KNIGHT
+            elif pc == 'b': want_promo = PROMO_BISHOP
+
+        # Search generated moves for a match
+        buf   = [0] * 218
+        count = generate_all_moves(board, buf, 0)
+        for i in range(count):
+            m = buf[i]
+            if move_from(m) == from_sq and move_to(m) == to_sq:
+                if want_promo == PROMO_NONE or move_promo(m) == want_promo:
+                    return m
+
+        # Fallback: encode directly (e.g. sliding piece moves not yet generated)
+        return encode_move(from_sq, to_sq) | (want_promo << 12)
+
+    # ── Position parsing ──────────────────────────────────────────────────────
+
+    def _apply_position(line):
+        """
+        Parse a 'position' UCI command and return the resulting BoardState.
+
+        Supported:
+            position startpos
+            position startpos moves e2e4 e7e5 g1f3 ...
+
+        Not yet supported:
+            position fen <fen_string> [moves ...]   (Phase 3)
+        """
+        board = BoardState()   # always start from the initial position
+
+        # Find the move list, if any
+        idx = line.find(' moves ')
+        if idx == -1:
+            return board
+
+        for token in line[idx + 7:].split():
+            if token:
+                board = make_move(board, _parse_uci_move(token, board))
+
+        return board
+
+    # ── UCI loop ──────────────────────────────────────────────────────────────
+
+    def _uci_loop():
+        """
+        Main UCI input/output loop.
+
+        Reads one line at a time from stdin, dispatches on the command,
+        and flushes stdout after every response — required by the UCI spec
+        so GUIs don't stall waiting for a newline-terminated flush.
+        """
+        board         = BoardState()
+        default_depth = 4
+
+        while True:
+            try:
+                line = _sys.stdin.readline()
+            except (KeyboardInterrupt, EOFError):
+                break
+
+            if not line:          # EOF
+                break
+
+            cmd = line.strip()
+            if not cmd:
+                continue
+
+            # ── uci ───────────────────────────────────────────────────────────
+            if cmd == 'uci':
+                _sys.stdout.write('id name FastPy-Engine\n')
+                _sys.stdout.write('id author Gokul Chandar\n')
+                _sys.stdout.write('uciok\n')
+                _sys.stdout.flush()
+
+            # ── isready ───────────────────────────────────────────────────────
+            elif cmd == 'isready':
+                _sys.stdout.write('readyok\n')
+                _sys.stdout.flush()
+
+            # ── ucinewgame ────────────────────────────────────────────────────
+            elif cmd == 'ucinewgame':
+                board = BoardState()
+
+            # ── position ──────────────────────────────────────────────────────
+            elif cmd.startswith('position'):
+                if 'startpos' in cmd:
+                    board = _apply_position(cmd)
+                # 'position fen ...' silently ignored until Phase 3
+
+            # ── go ────────────────────────────────────────────────────────────
+            elif cmd.startswith('go'):
+                search_depth = default_depth
+                parts = cmd.split()
+                if 'depth' in parts:
+                    di = parts.index('depth')
+                    if di + 1 < len(parts):
+                        try:
+                            search_depth = int(parts[di + 1])
+                        except ValueError:
+                            pass
+
+                best = _find_best_move_py(board, search_depth)
+                if best == 0:
+                    _sys.stdout.write('bestmove 0000\n')
+                else:
+                    _sys.stdout.write('bestmove ' + _move_to_uci(best) + '\n')
+                _sys.stdout.flush()
+
+            # ── stop / setoption / debug / register ───────────────────────────
+            elif cmd in ('stop', 'setoption', 'register', 'debug', 'ponderhit'):
+                pass   # silently ignored in Phase 1
+
+            # ── quit ──────────────────────────────────────────────────────────
+            elif cmd == 'quit':
+                break
+
+            # unknown commands silently ignored (UCI spec)
+
+    _uci_loop()
