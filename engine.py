@@ -57,6 +57,12 @@ RANK_8: Final[uint64] = 0xFF00000000000000
 
 FULL_BOARD: Final[uint64] = 0xFFFFFFFFFFFFFFFF
 
+# BIT_ONE is used as `BIT_ONE << sq` to produce a uint64 single-bit mask.
+# Plain `1 << sq` would be a 32-bit int shift in C++ — wrong for sq > 30.
+# FastPy emits `constexpr uint64_t BIT_ONE = 0x00000001ULL` so the shift
+# result is always uint64_t.
+BIT_ONE: Final[uint64] = 1
+
 # =============================================================================
 # STARTING POSITIONS
 # =============================================================================
@@ -281,6 +287,142 @@ class BoardState:
     def empty_squares(self) -> uint64:
         """All empty squares."""
         return ~self.all_pieces() & FULL_BOARD
+
+
+# =============================================================================
+# MAKE MOVE
+# Apply a packed move word to a board copy and return the new position.
+#
+# FastPy / C++ value semantics: BoardState is passed by value (copied).
+# The function modifies its local copy and returns it.
+# The caller receives the new position; the original is unchanged.
+# This eliminates the need for an explicit unmake — the old board is
+# simply still on the caller's stack.
+#
+# Handles: quiet moves, captures, en passant, double-pawn push (sets ep square),
+#          promotions (queen / knight / bishop), castling (Phase 3).
+# =============================================================================
+
+def make_move(board: BoardState, move: uint64) -> BoardState:
+    """
+    Return a new BoardState with `move` applied.
+
+    The caller keeps its original board unchanged.  Recursive search uses:
+        new_board: BoardState = make_move(board, moves[i])
+        score: int32 = -alpha_beta(new_board, depth - 1, -beta, -alpha)
+    """
+    from_sq: int32 = move_from(move)
+    to_sq:   int32 = move_to(move)
+    promo:   int32 = move_promo(move)
+    flag:    int32 = move_flag(move)
+
+    from_bb: uint64 = BIT_ONE << from_sq
+    to_bb:   uint64 = BIT_ONE << to_sq
+
+    if board.white_to_move:
+        # ── Clear captured black piece from destination ────────────────────────
+        board.black_pawns   = board.black_pawns   & ~to_bb
+        board.black_knights = board.black_knights & ~to_bb
+        board.black_bishops = board.black_bishops & ~to_bb
+        board.black_rooks   = board.black_rooks   & ~to_bb
+        board.black_queens  = board.black_queens  & ~to_bb
+        board.black_king    = board.black_king    & ~to_bb
+
+        # ── En passant: remove the captured pawn one rank south of to_sq ──────
+        if flag == FLAG_EN_PASSANT:
+            ep_capture: uint64 = to_bb >> 8
+            board.black_pawns = board.black_pawns & ~ep_capture
+
+        # ── Move the white piece ───────────────────────────────────────────────
+        if board.white_pawns & from_bb:
+            board.white_pawns = board.white_pawns & ~from_bb
+            if promo == PROMO_NONE:
+                board.white_pawns   = board.white_pawns   | to_bb
+                # Set en passant square for double push
+                if to_sq - from_sq == 16:
+                    board.en_passant_square = BIT_ONE << (from_sq + 8)
+                else:
+                    board.en_passant_square = 0
+            elif promo == PROMO_QUEEN:
+                board.white_queens  = board.white_queens  | to_bb
+                board.en_passant_square = 0
+            elif promo == PROMO_KNIGHT:
+                board.white_knights = board.white_knights | to_bb
+                board.en_passant_square = 0
+            else:
+                board.white_bishops = board.white_bishops | to_bb
+                board.en_passant_square = 0
+        elif board.white_knights & from_bb:
+            board.white_knights = (board.white_knights & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.white_bishops & from_bb:
+            board.white_bishops = (board.white_bishops & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.white_rooks & from_bb:
+            board.white_rooks = (board.white_rooks & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.white_queens & from_bb:
+            board.white_queens = (board.white_queens & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.white_king & from_bb:
+            board.white_king = (board.white_king & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        else:
+            board.en_passant_square = 0
+
+    else:
+        # ── Clear captured white piece from destination ────────────────────────
+        board.white_pawns   = board.white_pawns   & ~to_bb
+        board.white_knights = board.white_knights & ~to_bb
+        board.white_bishops = board.white_bishops & ~to_bb
+        board.white_rooks   = board.white_rooks   & ~to_bb
+        board.white_queens  = board.white_queens  & ~to_bb
+        board.white_king    = board.white_king    & ~to_bb
+
+        # ── En passant: remove the captured pawn one rank north of to_sq ──────
+        if flag == FLAG_EN_PASSANT:
+            ep_capture = to_bb << 8
+            board.white_pawns = board.white_pawns & ~ep_capture
+
+        # ── Move the black piece ───────────────────────────────────────────────
+        if board.black_pawns & from_bb:
+            board.black_pawns = board.black_pawns & ~from_bb
+            if promo == PROMO_NONE:
+                board.black_pawns   = board.black_pawns   | to_bb
+                if from_sq - to_sq == 16:
+                    board.en_passant_square = BIT_ONE << (from_sq - 8)
+                else:
+                    board.en_passant_square = 0
+            elif promo == PROMO_QUEEN:
+                board.black_queens  = board.black_queens  | to_bb
+                board.en_passant_square = 0
+            elif promo == PROMO_KNIGHT:
+                board.black_knights = board.black_knights | to_bb
+                board.en_passant_square = 0
+            else:
+                board.black_bishops = board.black_bishops | to_bb
+                board.en_passant_square = 0
+        elif board.black_knights & from_bb:
+            board.black_knights = (board.black_knights & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.black_bishops & from_bb:
+            board.black_bishops = (board.black_bishops & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.black_rooks & from_bb:
+            board.black_rooks = (board.black_rooks & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.black_queens & from_bb:
+            board.black_queens = (board.black_queens & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        elif board.black_king & from_bb:
+            board.black_king = (board.black_king & ~from_bb) | to_bb
+            board.en_passant_square = 0
+        else:
+            board.en_passant_square = 0
+
+    board.white_to_move = not board.white_to_move
+    board.halfmove_clock = board.halfmove_clock + 1
+    return board
 
 
 # =============================================================================
@@ -720,9 +862,8 @@ def alpha_beta(
     best: int32 = NEG_INF
     i: int32 = 0
     while i < count:
-        # Phase 1 placeholder: make/unmake not yet implemented.
-        # Phase 2 will apply moves[i] to a copy of the board, recurse, unmake.
-        score: int32 = evaluate(board)
+        new_board: BoardState = make_move(board, moves[i])
+        score: int32 = -alpha_beta(new_board, depth - 1, -beta, -alpha)
 
         if score > best:
             best = score
@@ -760,10 +901,8 @@ def find_best_move(
     i: int32 = 0
     while i < count:
         move: uint64 = moves[i]
-
-        # Phase 2: apply move → recurse → unmake
-        # Phase 1: use static evaluation as placeholder
-        score: int32 = -alpha_beta(board, depth - 1, -beta, -alpha)
+        new_board: BoardState = make_move(board, move)
+        score: int32 = -alpha_beta(new_board, depth - 1, -beta, -alpha)
 
         if score > best_score:
             best_score = score
