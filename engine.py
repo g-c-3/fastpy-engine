@@ -183,6 +183,70 @@ def move_flag(move: uint64) -> int32:
 
 
 # =============================================================================
+# MOVE SCORING — MVV-LVA (Most Valuable Victim - Least Valuable Attacker)
+# Used to order moves before searching: try captures of high-value pieces first.
+# =============================================================================
+
+def piece_at_square(sq: int32, board: BoardState) -> int32:
+    """
+    Return the material value of the piece on the given square.
+    Returns 0 if the square is empty or occupied by a king.
+    Used for MVV-LVA move ordering.
+    """
+    sq_bb: uint64 = BIT_ONE << sq
+    if (sq_bb & (board.white_pawns | board.black_pawns)) != 0:
+        return VAL_PAWN
+    if (sq_bb & (board.white_knights | board.black_knights)) != 0:
+        return VAL_KNIGHT
+    if (sq_bb & (board.white_bishops | board.black_bishops)) != 0:
+        return VAL_BISHOP
+    if (sq_bb & (board.white_rooks | board.black_rooks)) != 0:
+        return VAL_ROOK
+    if (sq_bb & (board.white_queens | board.black_queens)) != 0:
+        return VAL_QUEEN
+    return 0
+
+
+def mvv_lva(move: uint64, board: BoardState) -> int32:
+    """
+    MVV-LVA capture score: victim_value * 10 - attacker_value.
+    Higher scores = try first. Quiet moves score 0.
+    Examples: QxP = 900*10 - 100 = 8900, PxQ = 100*10 - 900 = 100.
+    """
+    to_sq: int32 = move_to(move)
+    from_sq: int32 = move_from(move)
+    victim: int32 = piece_at_square(to_sq, board)
+    if victim == 0:
+        return 0
+    attacker: int32 = piece_at_square(from_sq, board)
+    return victim * 10 - attacker
+
+
+def sort_moves(moves: uint64[218], count: int32, board: BoardState) -> None:
+    """
+    In-place selection sort of moves[] by MVV-LVA score (descending).
+    Captures tried before quiet moves. Among captures: PxQ before QxP.
+    O(n²) — acceptable for n ≤ 218.
+    FastPy: moves decays to uint64_t* in C++ — in-place writes work correctly.
+    """
+    outer_i: int32 = 0
+    while outer_i < count:
+        best_j: int32 = outer_i
+        best_score: int32 = mvv_lva(moves[outer_i], board)
+        j: int32 = outer_i + 1
+        while j < count:
+            s: int32 = mvv_lva(moves[j], board)
+            if s > best_score:
+                best_score = s
+                best_j = j
+            j += 1
+        tmp: uint64 = moves[outer_i]
+        moves[outer_i] = moves[best_j]
+        moves[best_j] = tmp
+        outer_i += 1
+
+
+# =============================================================================
 # BITBOARD UTILITIES
 # These compile to single-clock-cycle CPU hardware instructions via FastPy.
 # =============================================================================
@@ -1266,11 +1330,85 @@ def evaluate(board: BoardState) -> int32:
 
 
 # =============================================================================
+# QUIESCENCE SEARCH
+# At leaf nodes, keep searching captures until the position is "quiet".
+# Prevents the horizon effect — engine won't hang pieces at the search edge.
+# =============================================================================
+
+def generate_captures(board: BoardState, moves: uint64[218], count: int32) -> int32:
+    """
+    Generate legal capture moves only (for quiescence search).
+    Runs generate_all_moves then filters for moves landing on enemy squares
+    (or en passant captures), verifying legality via is_in_check.
+
+    FastPy: moves decays to uint64_t* — pointer fill pattern, zero allocation.
+    """
+    all_moves: uint64[218]
+    all_count: int32 = 0
+    all_count = generate_all_moves(board, all_moves, all_count)
+
+    enemy: uint64 = 0
+    if board.white_to_move:
+        enemy = board.black_pieces()
+    else:
+        enemy = board.white_pieces()
+
+    i: int32 = 0
+    while i < all_count:
+        move: uint64 = all_moves[i]
+        to_sq: int32 = move_to(move)
+        to_bb: uint64 = BIT_ONE << to_sq
+        is_ep: bool8 = move_flag(move) == FLAG_EN_PASSANT
+        if ((to_bb & enemy) != 0) or is_ep:
+            new_board: BoardState = make_move(board, move)
+            if not is_in_check(new_board):
+                moves[count] = move
+                count = count + 1
+        i += 1
+
+    return count
+
+
+def quiescence(board: BoardState, alpha: int32, beta: int32) -> int32:
+    """
+    Quiescence search — extend the search at leaf nodes until the position
+    is quiet (no captures left). This prevents the horizon effect where the
+    engine evaluates a position just before losing a piece.
+
+    Stand-pat: if the static evaluation already beats beta, prune immediately.
+    Only captures and en passant are searched (no quiet moves).
+
+    FastPy: captures[] is a C-style stack array — zero heap allocation.
+    """
+    stand_pat: int32 = evaluate(board)
+    if stand_pat >= beta:
+        return beta
+    if stand_pat > alpha:
+        alpha = stand_pat
+
+    captures: uint64[218]
+    cap_count: int32 = 0
+    cap_count = generate_captures(board, captures, cap_count)
+
+    i: int32 = 0
+    while i < cap_count:
+        new_board: BoardState = make_move(board, captures[i])
+        score: int32 = -quiescence(new_board, -beta, -alpha)
+        if score >= beta:
+            return beta
+        if score > alpha:
+            alpha = score
+        i += 1
+
+    return alpha
+
+
+# =============================================================================
 # SEARCH
 # Negamax with Alpha-Beta pruning.
 # Move list is a stack array — no heap allocation, no GC pause, ever.
 #
-# Phase 3: uses generate_legal_moves() for correctness (king safety ensured).
+# Phase 4: quiescence search at depth 0, MVV-LVA move ordering.
 # =============================================================================
 
 def alpha_beta(
@@ -1280,18 +1418,20 @@ def alpha_beta(
     beta: int32,
 ) -> int32:
     """
-    Negamax alpha-beta search.
+    Negamax alpha-beta search with quiescence extension and MVV-LVA ordering.
 
-    Returns the score from the side-to-move's perspective.
-    Positive = side to move is winning. Depth 0 = static evaluation.
+    Phase 4 improvements:
+    - depth == 0: enters quiescence search instead of static eval
+    - Moves are sorted by MVV-LVA score before the search loop
+      so that captures of high-value pieces are tried first
 
     FastPy guarantees zero heap allocation:
     - moves[] is a C-style stack array  (uint64_t moves[218])
-    - pseudo[] inside generate_legal_moves is also stack-allocated
+    - quiescence captures[] is also stack-allocated
     - No dynamic lists, no GC, no interpreter overhead
     """
     if depth == 0:
-        return evaluate(board)
+        return quiescence(board, alpha, beta)
 
     moves: uint64[218]
     count: int32 = 0
@@ -1299,8 +1439,9 @@ def alpha_beta(
 
     if count == 0:
         # No legal moves. Stalemate or checkmate — return 0 (draw placeholder).
-        # Phase 4: distinguish mate (-INF) from stalemate (0) via check detection.
         return 0
+
+    sort_moves(moves, count, board)
 
     best: int32 = NEG_INF
     i: int32 = 0
