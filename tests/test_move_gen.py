@@ -24,9 +24,9 @@ import sys
 import os
 
 # Add the repo root to path
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import importlib.util
-spec = importlib.util.spec_from_file_location("engine", os.path.join(os.path.dirname(__file__), "engine.py"))
+spec = importlib.util.spec_from_file_location("engine", os.path.join(os.path.dirname(os.path.dirname(__file__)), "engine.py"))
 mod = importlib.util.module_from_spec(spec)
 mod.__name__ = "engine"
 spec.loader.exec_module(mod)

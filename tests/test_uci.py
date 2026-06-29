@@ -23,7 +23,7 @@ from pathlib import Path
 # FIXTURE — spawns one engine process per test function
 # =============================================================================
 
-ENGINE_CMD = ["python3", str(Path(__file__).parent.parent / "engine.py")]
+ENGINE_CMD = ["python3", str(Path(__file__).parent.parent / "run.py")]
 
 
 class UCISession:
