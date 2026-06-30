@@ -1292,7 +1292,184 @@ def generate_legal_moves(
         i += 1
 
     return count
+# =============================================================================
+# PIECE-SQUARE TABLES (PST)
+# Positional bonuses in centipawns for each piece type at each square.
+#
+# Implemented as rank/file functions — no lookup arrays, pure arithmetic.
+# FastPy compiles these to straight-line C++ with branch prediction hints.
+#
+# Convention:
+#   rank = sq >> 3    (0 = rank 1 ... 7 = rank 8)
+#   file = sq & 7     (0 = file a ... 7 = file h)
+#   is_white: True uses rank as-is; False mirrors rank (7 - rank).
+#
+# Values derived from Tomasz Michniewski's Simplified Evaluation Function
+# (public domain), approximated as separable rank+file components.
+# =============================================================================
 
+def pst_pawn_sq(rank: int32, file: int32) -> int32:
+    """
+    Pawn PST bonus for a square given rank and file (white perspective).
+    rank 0 = rank 1 (impossible for pawns in play), rank 6 = rank 7 (promotion zone).
+    """
+    rank_b: int32 = 0
+    if rank == 6:
+        rank_b = 50
+    elif rank == 5:
+        rank_b = 30
+    elif rank == 4:
+        rank_b = 20
+    elif rank == 3:
+        rank_b = 15
+    elif rank == 2:
+        rank_b = 5
+
+    file_b: int32 = 0
+    if file == 3 or file == 4:
+        file_b = 10
+    elif file == 2 or file == 5:
+        file_b = 5
+    elif file == 0 or file == 7:
+        file_b = -10
+
+    return rank_b + file_b
+
+
+def pst_knight_sq(rank: int32, file: int32) -> int32:
+    """
+    Knight PST bonus. Knights are strongest in the centre, weakest on edges.
+    Separable rank+file bonuses approximate the standard knight table.
+    """
+    rank_b: int32 = 0
+    if rank == 0 or rank == 7:
+        rank_b = -20
+    elif rank == 1 or rank == 6:
+        rank_b = -10
+    elif rank == 3 or rank == 4:
+        rank_b = 10
+
+    file_b: int32 = 0
+    if file == 0 or file == 7:
+        file_b = -20
+    elif file == 1 or file == 6:
+        file_b = -10
+    elif file == 3 or file == 4:
+        file_b = 10
+
+    return rank_b + file_b
+
+
+def pst_bishop_sq(rank: int32, file: int32) -> int32:
+    """
+    Bishop PST bonus. Bishops reward central placement and long diagonals.
+    Penalise edge squares where the bishop controls fewer squares.
+    """
+    center_b: int32 = 0
+    if (rank == 3 or rank == 4) and (file == 3 or file == 4):
+        center_b = 15
+    elif (rank == 2 or rank == 5) and (file == 2 or file == 5):
+        center_b = 10
+    elif (rank == 3 or rank == 4) and (file == 2 or file == 5):
+        center_b = 5
+    elif (rank == 2 or rank == 5) and (file == 3 or file == 4):
+        center_b = 5
+
+    edge_b: int32 = 0
+    if rank == 0 or rank == 7 or file == 0 or file == 7:
+        edge_b = -10
+
+    # Main diagonal bonus (a1-h8: rank==file; a8-h1: rank+file==7)
+    diag_b: int32 = 0
+    if rank == file or rank + file == 7:
+        diag_b = 5
+
+    return center_b + edge_b + diag_b
+
+
+def pst_rook_sq(rank: int32, file: int32) -> int32:
+    """
+    Rook PST bonus. 7th rank dominance is the biggest positional asset;
+    central files are slightly preferable to edge files.
+    """
+    rank_b: int32 = 0
+    if rank == 6:
+        rank_b = 20    # 7th rank — controls enemy pawn rank
+    elif rank == 7:
+        rank_b = 10    # 8th rank — behind promotion zone
+
+    file_b: int32 = 0
+    if file == 3 or file == 4:
+        file_b = 5     # Central open files
+
+    return rank_b + file_b
+
+
+def pst_king_sq(rank: int32, file: int32, is_white: bool8) -> int32:
+    """
+    King PST bonus (middlegame). Strongly rewards castled positions,
+    penalises kings stuck in the centre.
+
+    rank is received pre-mirrored (i.e. always from the piece's own perspective:
+    rank 0 = back rank, rank 7 = opponent's back rank). pst_sum performs the
+    mirroring before calling this function.
+    """
+    if is_white:
+        if rank != 0:
+            return 0    # King should stay on back rank in MG
+        if file == 6 or file == 7:
+            return 30   # Kingside castle (g1/h1)
+        if file == 1 or file == 2:
+            return 20   # Queenside castle (b1/c1)
+        if file == 3 or file == 4:
+            return -30  # Exposed on d1/e1
+        return 0
+    else:
+        # rank is already mirrored in pst_sum: black's rank 7 → 0
+        if rank != 0:
+            return 0    # Black back rank (mirrored rank 0 = original rank 7)
+        if file == 6 or file == 7:
+            return 30   # g8/h8
+        if file == 1 or file == 2:
+            return 20   # b8/c8
+        if file == 3 or file == 4:
+            return -30  # d8/e8
+        return 0
+
+
+def pst_sum(pieces: uint64, is_white: bool8, ptype: int32) -> int32:
+    """
+    Sum PST bonuses for all set bits in `pieces`.
+    ptype: 0=pawn, 1=knight, 2=bishop, 3=rook, 4=king
+
+    Iterates with lsb/pop_lsb — compiles to TZCNT/BLSR per iteration.
+    FastPy: temp is a C-style stack variable — zero allocation.
+    """
+    score: int32 = 0
+    temp: uint64 = pieces
+    while temp:
+        sq: int32 = lsb(temp)
+        rank: int32 = sq >> 3
+        file: int32 = sq & 7
+        if not is_white:
+            rank = 7 - rank
+
+        bonus: int32 = 0
+        if ptype == 0:
+            bonus = pst_pawn_sq(rank, file)
+        elif ptype == 1:
+            bonus = pst_knight_sq(rank, file)
+        elif ptype == 2:
+            bonus = pst_bishop_sq(rank, file)
+        elif ptype == 3:
+            bonus = pst_rook_sq(rank, file)
+        elif ptype == 4:
+            bonus = pst_king_sq(rank, file, is_white)
+
+        score = score + bonus
+        temp = pop_lsb(temp)
+
+    return score
 
 # =============================================================================
 # EVALUATION
