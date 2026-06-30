@@ -170,7 +170,9 @@ def _alpha_beta_py(board, depth, alpha, beta):
 
     moves, count = _generate_legal_moves_py(board)
     if count == 0:
-        return 0
+        if is_side_to_move_in_check(board):
+            return NEG_INF + depth   # Checkmate — shorter mates score higher
+        return 0   # Stalemate
 
     # MVV-LVA ordering: sort by capture priority
     move_list = [(moves[i], _mvv_lva_py(moves[i], board)) for i in range(count)]
