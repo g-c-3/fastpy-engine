@@ -1479,27 +1479,52 @@ def pst_sum(pieces: uint64, is_white: bool8, ptype: int32) -> int32:
 
 def evaluate(board: BoardState) -> int32:
     """
-    Fast static evaluation — material count only (Phase 1/2).
+    Static evaluation — material count + Piece-Square Table (PST) bonuses.
 
     Returns centipawns from the perspective of the side to move.
     Positive = side to move is winning.
 
+    Phase 4: PST bonuses added for all piece types (pawns, knights, bishops,
+    rooks, kings). Queens use material value only (PST less impactful for queens).
+
     FastPy compiles each popcount() call to __builtin_popcountll()  [POPCNT, 1 cycle].
+    FastPy compiles pst_sum iterations to TZCNT + BLSR per piece.
     """
-    white_score: int32 = (
+    # --- Material ---
+    white_mat: int32 = (
         popcount(board.white_pawns)   * VAL_PAWN   +
         popcount(board.white_knights) * VAL_KNIGHT +
         popcount(board.white_bishops) * VAL_BISHOP +
         popcount(board.white_rooks)   * VAL_ROOK   +
         popcount(board.white_queens)  * VAL_QUEEN
     )
-    black_score: int32 = (
+    black_mat: int32 = (
         popcount(board.black_pawns)   * VAL_PAWN   +
         popcount(board.black_knights) * VAL_KNIGHT +
         popcount(board.black_bishops) * VAL_BISHOP +
         popcount(board.black_rooks)   * VAL_ROOK   +
         popcount(board.black_queens)  * VAL_QUEEN
     )
+
+    # --- Piece-Square Table bonuses ---
+    white_pst: int32 = (
+        pst_sum(board.white_pawns,   True, 0) +
+        pst_sum(board.white_knights, True, 1) +
+        pst_sum(board.white_bishops, True, 2) +
+        pst_sum(board.white_rooks,   True, 3) +
+        pst_sum(board.white_king,    True, 4)
+    )
+    black_pst: int32 = (
+        pst_sum(board.black_pawns,   False, 0) +
+        pst_sum(board.black_knights, False, 1) +
+        pst_sum(board.black_bishops, False, 2) +
+        pst_sum(board.black_rooks,   False, 3) +
+        pst_sum(board.black_king,    False, 4)
+    )
+
+    white_score: int32 = white_mat + white_pst
+    black_score: int32 = black_mat + black_pst
+
     if board.white_to_move:
         return white_score - black_score
     else:
