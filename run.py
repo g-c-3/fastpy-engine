@@ -36,7 +36,7 @@ import time
 
 from engine import (
     BoardState, make_move, evaluate,
-    generate_all_moves, is_in_check,
+    generate_all_moves, is_in_check, is_side_to_move_in_check,
     piece_at_square,
     encode_move, encode_move_promo, encode_move_flag,
     move_from, move_to, move_promo, move_flag,
