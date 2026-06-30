@@ -1660,8 +1660,13 @@ def alpha_beta(
     count = generate_legal_moves(board, moves, count)
 
     if count == 0:
-        # No legal moves. Stalemate or checkmate — return 0 (draw placeholder).
-        return 0
+        # No legal moves — checkmate or stalemate.
+        # is_side_to_move_in_check() checks the side whose turn it is right
+        # now (board.white_to_move), distinct from is_in_check() which checks
+        # the side that just moved (used for move legality filtering).
+        if is_side_to_move_in_check(board):
+            return NEG_INF + depth   # Checkmate: prefer shorter mates
+        return 0   # Stalemate: draw
 
     sort_moves(moves, count, board)
 
