@@ -361,8 +361,11 @@ def uci_loop():
     Outputs 'info depth N score cp S time T' lines during search.
     """
     board         = BoardState()
-    default_depth = 5          # Fallback when no time/depth specified
-
+  
+    default_depth = 4          # Fallback when no time/depth specified
+                                # (was 5; PST evaluation increased per-node
+                                # cost enough that depth 5 took 60s+ with no
+                                # mid-search time abort — see DECISIONS D-26)
     while True:
         try:
             line = sys.stdin.readline()
