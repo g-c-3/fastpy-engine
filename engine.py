@@ -1151,6 +1151,26 @@ def is_in_check(board: BoardState) -> bool8:
         # White just moved — is white's king attacked by black?
         return is_sq_attacked(white_king_sq, board, True)
 
+def is_side_to_move_in_check(board: BoardState) -> bool8:
+    """
+    Return True if the side whose turn it currently is (board.white_to_move)
+    is in check right now — i.e. the OPPONENT of is_in_check()'s target.
+
+    Used for checkmate/stalemate detection: when generate_legal_moves()
+    returns zero moves for the side to move, this distinguishes:
+      - in check + zero moves  → checkmate
+      - not in check + zero moves → stalemate
+
+    is_in_check() answers a different question (did the side that JUST
+    moved leave themselves in check, for move legality filtering) and
+    must not be reused here — the side relationship is inverted.
+    """
+    if board.white_to_move:
+        white_king_sq: int32 = lsb(board.white_king)
+        return is_sq_attacked(white_king_sq, board, True)
+    else:
+        black_king_sq: int32 = lsb(board.black_king)
+        return is_sq_attacked(black_king_sq, board, False)
 
 # =============================================================================
 # CASTLING MOVE GENERATION
